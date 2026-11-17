@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stereo Dome Viewer</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font:13px/1.4 system-ui,sans-serif;color:#e8e8ea}
+  canvas{display:block;touch-action:none}
+  #panel{position:fixed;top:10px;left:10px;width:270px;max-height:calc(100% - 80px);overflow:auto;padding:12px;
+    background:rgba(20,20,24,.85);border:1px solid #444;border-radius:10px}
+  #panel h1{font-size:14px;margin:0 0 8px}
+  #panel label{display:block;margin:6px 0 0}
+  #panel input[type=range]{width:100%}
+  #panel input[type=text],#panel select{width:100%;box-sizing:border-box;background:#111;color:inherit;border:1px solid #555;border-radius:5px;padding:4px}
+  #panel button{margin-top:8px;padding:5px 10px;background:#2b3550;color:inherit;border:1px solid #556;border-radius:5px;cursor:pointer}
+  #panel small{display:block;margin-top:8px;color:#9a9aa5}
+  #status{color:#ffb4a8;margin-top:6px}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1>Stereo Dome Viewer (SBS L|R)</h1>
+  <label>Image file <input type="file" id="file" accept="image/*"></label>
+  <label>…or URL (CORS-enabled) <input type="text" id="url" placeholder="https://…/image.jpg"></label>
+  <button id="loadUrl">Load URL</button>
+  <label>Projection
+    <select id="mode"><option value="0">Equirectangular (VR180/360)</option><option value="1">Fisheye (equidistant)</option></select>
+  </label>
+  <label>Desktop preview eye
+    <select id="eye"><option value="1">Left</option><option value="2">Right</option></select>
+  </label>
+  <label><input type="checkbox" id="swap"> Swap eyes (R|L / cross-eyed)</label>
+  <div id="rows"></div>
+  <button id="reset">Reset view</button>
+  <div id="status"></div>
+  <small>Desktop: drag = pan, wheel = zoom, drop an image anywhere, S = swap eyes, R = reset.<br>
+  Quest: hold trigger &amp; move controller = drag, thumbstick up/down = zoom, grip = reset.<br>
+  Fisheye uses "Image H FOV" as the lens FOV.</small>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+const D = Math.PI / 180;
+const P = { domeH: 180, domeV: 180, imgH: 180, imgV: 180, mode: 0, swap: false, eye: 1, zoom: 1 };
+const view = { yaw: 0, pitch: 0 };
+const $ = id => document.getElementById(id);
+const status = m => $('status').textContent = m || '';
+
+/* ---------- renderer / scene ---------- */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local');
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 100);
+camera.layers.set(1); // desktop preview shows the left-eye mesh
+
+/* ---------- shader: spherical (azimuthal) zoom + pan, per-eye half of the texture ---------- */
+const vertexShader = `
+  varying vec3 vDir;
+  void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`;
+
+const fragmentShader = `
+  precision highp float;
+  uniform sampler2D map; uniform mat3 rot;
+  uniform float zoom, eye, mode; uniform vec2 span;
+  varying vec3 vDir;
+  void main(){
+    vec3 w = normalize(vDir);
+    // Angle from the dome's forward axis, scaled by 1/zoom: magnification stays spherical,
+    // so edges keep curving toward the centre instead of flattening into a cylinder/plane.
+    float a  = acos(clamp(-w.z,-1.,1.));
+    float l  = length(w.xy);
+    vec2 dir = l > 1e-6 ? w.xy / l : vec2(0.);
+    float a2 = a / zoom;
+    vec3 c = rot * vec3(dir * sin(a2), -cos(a2));      // pan = rotate content direction
+    vec2 uv;
+    if (mode < .5) {
+      uv = vec2(atan(c.x,-c.z)/span.x, asin(clamp(c.y,-1.,1.))/span.y) + .5;
+    } else {
+      float an = acos(clamp(-c.z,-1.,1.));
+      float m = length(c.xy); vec2 d = m > 1e-6 ? c.xy / m : vec2(0.);
+      uv = .5 + d * an / span.x;
+      if (length(uv-.5) > .5) discard;
+    }
+    if (uv.x<0.||uv.x>1.||uv.y<0.||uv.y>1.) discard;
+    uv.x = clamp(uv.x,.001,.999)*.5 + eye;               // pick left / right half
+    gl_FragColor = vec4(texture2D(map, uv).rgb, 1.);
+  }`;
+
+const shared = {
+  map:  { value: null },
+  rot:  { value: new THREE.Matrix3() },
+  zoom: { value: 1 },
+  mode: { value: 0 },
+  span: { value: new THREE.Vector2(Math.PI, Math.PI) }
+};
+const makeMat = () => new THREE.ShaderMaterial({
+  uniforms: { ...shared, eye: { value: 0 } },
+  vertexShader, fragmentShader, side: THREE.DoubleSide, depthTest: false, depthWrite: false
+});
+const matL = makeMat(), matR = makeMat();
+
+/* ---------- configurable partial-sphere dome ---------- */
+const dome = new THREE.Group();
+const meshL = new THREE.Mesh(new THREE.BufferGeometry(), matL);
+const meshR = new THREE.Mesh(new THREE.BufferGeometry(), matR);
+meshL.layers.set(1);  // WebXR: layer 1 = left eye
+meshR.layers.set(2);  // WebXR: layer 2 = right eye
+for (const m of [meshL, meshR]) { m.frustumCulled = false; m.renderOrder = -1; dome.add(m); }
+scene.add(dome);
+
+function buildDome() {
+  const nx = 96, ny = 64, H = P.domeH * D, V = P.domeV * D, R = 10, pos = [], idx = [];
+  for (let j = 0; j <= ny; j++) {
+    const lat = (j / ny - .5) * V;
+    for (let i = 0; i <= nx; i++) {
+      const lon = (i / nx - .5) * H;
+      pos.push(R * Math.cos(lat) * Math.sin(lon), R * Math.sin(lat), -R * Math.cos(lat) * Math.cos(lon));
+    }
+  }
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const a = j * (nx + 1) + i, b = a + 1, c = a + nx + 1, d = c + 1;
+    idx.push(a, b, c, b, d, c);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  meshL.geometry.dispose();
+  meshL.geometry = meshR.geometry = g;
+}
+buildDome();
+
+/* ---------- texture loading ---------- */
+function setTexture(src) {
+  const t = new THREE.Texture(src);
+  t.generateMipmaps = false;
+  t.minFilter = t.magFilter = THREE.LinearFilter;
+  t.needsUpdate = true;
+  if (shared.map.value) shared.map.value.dispose();
+  shared.map.value = t;
+}
+
+function setImage(img) {
+  let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height, src = img;
+  const max = Math.min(renderer.capabilities.maxTextureSize, 8192);
+  if (w > max || h > max) { // keep Quest-safe texture size
+    const s = max / Math.max(w, h), cv = document.createElement('canvas');
+    cv.width = Math.floor(w * s); cv.height = Math.floor(h * s);
+    cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+    src = cv; w = cv.width; h = cv.height;
+  }
+  setTexture(src);
+  // guess coverage from per-eye aspect ratio (user can tweak sliders afterwards)
+  const a = (w / 2) / h;
+  if (Math.abs(a - 1) < .1) { setP('imgH', 180); setP('imgV', 180); }
+  else if (Math.abs(a - 2) < .15) { setP('imgH', 360); setP('imgV', 180); }
+  else { setP('imgH', 180); setP('imgV', Math.min(180, Math.round(180 / a))); }
+  setP('domeH', P.imgH); setP('domeV', P.imgV);
+  status(`Loaded ${w}×${h}`);
+}
+
+function loadURL(url) {
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => setImage(img);
+  img.onerror = () => status('Could not load image (check URL / CORS).');
+  img.src = url;
+}
+function loadFile(f) {
+  if (!f || !f.type.startsWith('image/')) return;
+  const u = URL.createObjectURL(f), img = new Image();
+  img.onload = () => { setImage(img); URL.revokeObjectURL(u); };
+  img.onerror = () => status('Could not decode that image.');
+  img.src = u;
+}
+
+// Built-in test pattern (lat/long grid + depth markers with disparity) so it works out of the box
+function makeTest() {
+  const S = 1024, cv = document.createElement('canvas'); cv.width = S * 2; cv.height = S;
+  const g = cv.getContext('2d');
+  for (let e = 0; e < 2; e++) {
+    g.save(); g.translate(e * S, 0); g.beginPath(); g.rect(0, 0, S, S); g.clip();
+    g.fillStyle = '#10131a'; g.fillRect(0, 0, S, S);
+    const X = l => (l / 180 + .5) * S, Y = l => (.5 - l / 180) * S, sg = e ? -1 : 1;
+    g.lineWidth = 2;
+    for (let d = -90; d <= 90; d += 15) {
+      g.strokeStyle = d % 45 === 0 ? '#6ea8ff' : '#2b3550';
+      g.beginPath(); g.moveTo(X(d), 0); g.lineTo(X(d), S); g.stroke();
+      g.beginPath(); g.moveTo(0, Y(d)); g.lineTo(S, Y(d)); g.stroke();
+    }
+    [[0, 0, 0, '#fff'], [-40, 10, 6, '#ff6b6b'], [40, 10, -6, '#6bff8e'], [0, -30, 12, '#ffd166']].forEach(([lo, la, dp, col]) => {
+      g.fillStyle = col; g.beginPath(); g.arc(X(lo) + sg * dp, Y(la), 22, 0, 7); g.fill();
+    });
+    g.fillStyle = '#fff'; g.font = 'bold 40px sans-serif'; g.fillText(e ? 'RIGHT' : 'LEFT', S / 2 - 60, Y(60));
+    g.restore();
+  }
+  return cv;
+}
+setTexture(makeTest());
+
+/* ---------- UI ---------- */
+const defs = [
+  ['domeH', 'Dome width (°)', 30, 360, 1],
+  ['domeV', 'Dome height (°)', 30, 180, 1],
+  ['imgH', 'Image H FOV (°)', 30, 360, 1],
+  ['imgV', 'Image V FOV (°)', 30, 180, 1],
+  ['zoom', 'Zoom (×)', .3, 8, .01]
+];
+for (const [k, label, min, max, step] of defs) {
+  const r = document.createElement('label');
+  r.innerHTML = `${label}: <b id="v_${k}"></b><input type="range" id="r_${k}" min="${min}" max="${max}" step="${step}">`;
+  $('rows').appendChild(r);
+  r.querySelector('input').addEventListener('input', e => setP(k, +e.target.value));
+}
+function setP(k, v) {
+  P[k] = v;
+  $('r_' + k).value = v;
+  $('v_' + k).textContent = k === 'zoom' ? v.toFixed(2) : Math.round(v);
+  if (k === 'domeH' || k === 'domeV') buildDome();
+}
+defs.forEach(([k]) => setP(k, P[k]));
+const setZoom = z => setP('zoom', Math.min(8, Math.max(.3, z)));
+function resetView() { view.yaw = view.pitch = 0; setZoom(1); }
+
+$('file').onchange = e => loadFile(e.target.files[0]);
+$('loadUrl').onclick = () => $('url').value && loadURL($('url').value);
+$('mode').onchange = e => P.mode = +e.target.value;
+$('eye').onchange = e => { P.eye = +e.target.value; if (!renderer.xr.isPresenting) camera.layers.set(P.eye); };
+$('swap').onchange = e => P.swap = e.target.checked;
+$('reset').onclick = resetView;
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); loadFile(e.dataTransfer.files[0]); });
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 's' || e.key === 'S') { P.swap = !P.swap; $('swap').checked = P.swap; }
+  if (e.key === 'r' || e.key === 'R') resetView();
+});
+const qs = new URLSearchParams(location.search);
+if (qs.get('img')) loadURL(qs.get('img'));
+
+/* ---------- desktop drag + wheel ---------- */
+const cvs = renderer.domElement;
+let dragging = false;
+const clampPitch = () => view.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, view.pitch));
+cvs.addEventListener('pointerdown', e => { dragging = true; cvs.setPointerCapture(e.pointerId); });
+cvs.addEventListener('pointerup', () => dragging = false);
+cvs.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const k = camera.fov * D / innerHeight / P.zoom;   // px -> radians, slower when zoomed in
+  view.yaw += e.movementX * k;
+  view.pitch += e.movementY * k;
+  clampPitch();
+});
+cvs.addEventListener('wheel', e => { e.preventDefault(); setZoom(P.zoom * Math.exp(-e.deltaY * .0015)); }, { passive: false });
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- WebXR controllers ---------- */
+const tmpQ = new THREE.Quaternion(), tmpV = new THREE.Vector3();
+const drag = { ctrl: null, yaw: 0, pitch: 0 };
+function ray(c) {
+  c.getWorldQuaternion(tmpQ); tmpV.set(0, 0, -1).applyQuaternion(tmpQ);
+  return { yaw: Math.atan2(tmpV.x, -tmpV.z), pitch: Math.asin(Math.max(-1, Math.min(1, tmpV.y))) };
+}
+const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]),
+    new THREE.LineBasicMaterial({ color: 0xffffff }));
+  line.scale.z = .3; c.add(line);
+  c.addEventListener('selectstart', () => { drag.ctrl = c; const r = ray(c); drag.yaw = r.yaw; drag.pitch = r.pitch; });
+  c.addEventListener('selectend', () => { if (drag.ctrl === c) drag.ctrl = null; });
+  c.addEventListener('squeezestart', resetView);
+  scene.add(c);
+}
+renderer.xr.addEventListener('sessionstart', () => { camera.layers.set(0); $('panel').style.display = 'none'; });
+renderer.xr.addEventListener('sessionend', () => {
+  camera.layers.set(P.eye); $('panel').style.display = '';
+  camera.position.set(0, 0, 0); camera.quaternion.identity(); dome.position.set(0, 0, 0);
+});
+
+/* ---------- render loop ---------- */
+const qYaw = new THREE.Quaternion(), qPitch = new THREE.Quaternion(), qAll = new THREE.Quaternion(), m4 = new THREE.Matrix4();
+const AX = new THREE.Vector3(1, 0, 0), AY = new THREE.Vector3(0, 1, 0);
+let last = 0;
+renderer.setAnimationLoop(t => {
+  const dt = Math.min((t - last) / 1000, .1); last = t;
+
+  if (renderer.xr.isPresenting) {
+    dome.position.copy(camera.position);            // dome follows head position, stays world-locked in rotation
+    if (drag.ctrl) {                                 // controller drag
+      const r = ray(drag.ctrl);
+      view.yaw += wrap(r.yaw - drag.yaw) / P.zoom;
+      view.pitch -= (r.pitch - drag.pitch) / P.zoom;
+      drag.yaw = r.yaw; drag.pitch = r.pitch; clampPitch();
+    }
+    const session = renderer.xr.getSession();       // thumbstick zoom
+    if (session) for (const src of session.inputSources) {
+      const gp = src.gamepad;
+      if (gp && gp.axes.length >= 4 && Math.abs(gp.axes[3]) > .15) setZoom(P.zoom * Math.exp(-gp.axes[3] * dt * 1.5));
+    }
+  }
+
+  qYaw.setFromAxisAngle(AY, view.yaw);
+  qPitch.setFromAxisAngle(AX, view.pitch);
+  qAll.multiplyQuaternions(qYaw, qPitch);
+  shared.rot.value.setFromMatrix4(m4.makeRotationFromQuaternion(qAll));
+  shared.zoom.value = P.zoom;
+  shared.mode.value = P.mode;
+  shared.span.value.set(P.imgH * D, P.imgV * D);
+  matL.uniforms.eye.value = P.swap ? .5 : 0;
+  matR.uniforms.eye.value = P.swap ? 0 : .5;
+
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
